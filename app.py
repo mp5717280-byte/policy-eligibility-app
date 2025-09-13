@@ -1,12 +1,4 @@
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-import re
-from datetime import datetime, date
-from dateutil.relativedelta import relativedelta
-from openpyxl import load_workbook
-from openpyxl.styles.colors import Color
 
 st.set_page_config(page_title="LIC Plan Eligibility (Step 1 & 2)", layout="centered")
 
