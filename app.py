@@ -172,6 +172,7 @@ use_green = st.sidebar.checkbox("Use GREEN highlight filter", value=True)
 
 run = st.sidebar.button("Run Eligibility")
 
+
 # -------- Main --------
 if run:
     if not lic_file or not sheet2_file or not name:
