@@ -1,7 +1,6 @@
 # app.py
 import streamlit as st
 import pandas as pd
-import numpy as np
 import re
 from datetime import date
 
@@ -9,7 +8,7 @@ st.set_page_config(page_title="Policy Eligibility (Step 1 & 2)", layout="centere
 st.title("Policy Eligibility Checker — Step 1 & Step 2 (Clean Restart)")
 
 # ----------------------------
-# Helpers
+# Helpers (defined BEFORE use)
 # ----------------------------
 def calc_age_years(dob: date, purchase: date) -> float:
     """Age in years (decimal)."""
@@ -17,7 +16,7 @@ def calc_age_years(dob: date, purchase: date) -> float:
 
 def age_to_years(val):
     """Convert '90 days' / '3 months' / '18 years' / '18' → years (float)."""
-    if pd.isna(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
     if isinstance(val, (int, float)):
         return float(val)
@@ -35,13 +34,16 @@ def age_to_years(val):
 
 def normalize_end_text_to_nat(series: pd.Series) -> pd.Series:
     """Treat text like 'Active', 'Present' as blank end-date (still active)."""
-    return series.apply(
-        lambda v: pd.NaT if isinstance(v, str) and str(v).strip().lower()
-        in {"active","ongoing","present","current","till date","tilldate","till-date"} else v
-    )
+    def norm(v):
+        if isinstance(v, str) and str(v).strip().lower() in {
+            "active","ongoing","present","current","till date","tilldate","till-date"
+        }:
+            return pd.NaT
+        return v
+    return series.apply(norm)
 
 def build_step1_shortlist(lic_df: pd.DataFrame, uin_col, plan_col, start_col, end_col, purchase_date):
-    """Filter LIC plans active on purchase_date. (No green highlight to keep simple & robust)"""
+    """Filter LIC plans active on purchase_date. (No green highlight)"""
     # Parse dates
     start = pd.to_datetime(lic_df[start_col], errors="coerce") if start_col else pd.NaT
     end_raw = lic_df[end_col] if end_col else pd.Series([pd.NaT] * len(lic_df))
@@ -64,7 +66,7 @@ def build_step1_shortlist(lic_df: pd.DataFrame, uin_col, plan_col, start_col, en
     out = out.rename(columns=rename).drop_duplicates().reset_index(drop=True)
     return out
 
-def build_age_table(sheet2_xls: pd.ExcelFile, header_row_index: int) -> pd.DataFrame:
+def build_age_table(sheet2_xls, header_row_index: int) -> pd.DataFrame:
     """
     Combine all 'Policy ...' sheets into one UIN/min/max table.
     header_row_index is 0-based (use 1 for 2nd row in Excel).
@@ -109,7 +111,7 @@ def apply_age_filter(step1_df: pd.DataFrame, age_df: pd.DataFrame, age_years: fl
     return ok.drop_duplicates(subset=["UIN"]).reset_index(drop=True)
 
 # ----------------------------
-# Sidebar Inputs (simple & manual)
+# Sidebar Inputs (manual & simple)
 # ----------------------------
 st.sidebar.header("Upload Files")
 lic_file = st.sidebar.file_uploader("LIC 10 Year Plan (Excel)", type=["xlsx","xls"])
@@ -120,7 +122,7 @@ name = st.sidebar.text_input("Policy Holder Name", "")
 dob = st.sidebar.date_input("Date of Birth", value=date(2000, 1, 1))
 purchase = st.sidebar.date_input("Policy Purchase Date", value=date(2020, 3, 20))
 
-# Manual mapping always (to avoid auto-detect confusion)
+# Manual mapping (explicit is better than guessing)
 st.sidebar.header("LIC Sheet Settings")
 lic_sheet_name = st.sidebar.text_input("LIC sheet name (exact as in Excel)", value="")
 lic_header_row_1based = st.sidebar.number_input("LIC header row (1-based)", min_value=1, value=2, step=1,
@@ -187,14 +189,46 @@ if run:
         try:
             s2_header_idx = int(sheet2_header_row_1based) - 1
             sheet2_xls = pd.ExcelFile(sheet2_file)
-            age_df = build_age_table(sheet2_xls, header_row_index=s2_header_idx)
+            # Build age table from all sheets named like "Policy 1", "Policy 2", ...
+            age_df = pd.DataFrame()
+            rows = []
+            for s in sheet2_xls.sheet_names:
+                if not s.lower().startswith("policy"):
+                    continue
+                try:
+                    df = pd.read_excel(sheet2_xls, s, header=s2_header_idx)
+                except Exception:
+                    continue
+                if not all(c in df.columns for c in ["UIN","Minimum Entry Age","Maximum Entry Age"]):
+                    continue
+                for _, r in df.iterrows():
+                    rows.append({
+                        "UIN": str(r["UIN"]).strip().upper(),
+                        "MinAgeYears": age_to_years(r["Minimum Entry Age"]),
+                        "MaxAgeYears": age_to_years(r["Maximum Entry Age"]),
+                        "Sheet": s
+                    })
+            age_df = pd.DataFrame(rows)
             if age_df.empty:
-                st.error("Could not build Age table from Sheet 2. Check header row & that sheets are named like 'Policy 1', 'Policy 2', etc.")
+                st.error("Could not build Age table from Sheet 2. Check header row & that tabs are named like 'Policy 1', 'Policy 2', etc.")
                 st.stop()
+            age_df = age_df.dropna(subset=["UIN"]).drop_duplicates()
 
             # Step 2
             st.subheader("Step 2 — Age-Eligible Plans")
-            final_df = apply_age_filter(step1, age_df, age_years)
+            if step1.empty:
+                final_df = pd.DataFrame()
+            else:
+                s1 = step1.copy()
+                s1["UIN"] = s1["UIN"].astype(str).str.strip().str.upper()
+                merged = pd.merge(s1, age_df, on="UIN", how="left")
+                final_df = merged[
+                    (merged["MinAgeYears"].notna()) &
+                    (merged["MaxAgeYears"].notna()) &
+                    (merged["MinAgeYears"] <= age_years) &
+                    (merged["MaxAgeYears"] >= age_years)
+                ].drop_duplicates(subset=["UIN"]).reset_index(drop=True)
+
             if final_df.empty:
                 st.error("No plans eligible for this age based on Excel Sheet 2.")
             st.dataframe(final_df, use_container_width=True)
@@ -209,4 +243,4 @@ if run:
             st.exception(e)
 
 else:
-    st.info("Upload both Excel files, enter inputs, type the LIC sheet name, set header rows, then click **Run Eligibility**.")
+    st.info("Upload both Excel files, fill inputs, type the LIC sheet name, set header rows, then click **Run Eligibility**.")
