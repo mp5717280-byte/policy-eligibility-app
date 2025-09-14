@@ -3,9 +3,13 @@ import streamlit as st
 import pandas as pd
 import re
 from datetime import date
+from io import BytesIO
 
-st.set_page_config(page_title="Policy Eligibility (Auto)", layout="centered")
-st.title("Policy Eligibility Checker — Auto (Step 1 & Step 2)")
+# NEW: for reading the Word doc with module fields
+from docx import Document
+
+st.set_page_config(page_title="Policy Eligibility (Auto + Step 3)", layout="centered")
+st.title("Policy Eligibility Checker — Auto (Step 1, Step 2, Step 3)")
 
 # ----------------------------
 # Helpers
@@ -145,12 +149,98 @@ def step2_filter_by_age(step1_df, age_df, age_years):
     ]
     return ok.drop_duplicates(subset=["UIN"]).reset_index(drop=True)
 
+# ---------- NEW (STEP 3): UIN → Module → Fields ----------
+def find_uin_module_map(sheet2_xls):
+    """
+    Look for a sheet that contains a UIN-to-Module map.
+    Heuristics: any sheet that has a 'UIN' column AND a column whose header contains 'module'.
+    """
+    for s in sheet2_xls.sheet_names:
+        try:
+            raw = pd.read_excel(sheet2_xls, s, header=None)
+            h = detect_header_row(raw)
+            df = pd.read_excel(sheet2_xls, s, header=h)
+        except Exception:
+            continue
+        cols_lower = [str(c).strip().lower() for c in df.columns]
+        if "uin" in cols_lower and any("module" in l for l in cols_lower):
+            uin_col = df.columns[cols_lower.index("uin")]
+            mod_col = next(df.columns[i] for i,l in enumerate(cols_lower) if "module" in l)
+            m = df[[uin_col, mod_col]].dropna()
+            m.columns = ["UIN", "Module"]
+            # normalize
+            m["UIN"] = m["UIN"].astype(str).str.strip().str.upper()
+            # module as string like "Module 1" or just number
+            m["Module"] = m["Module"].astype(str).str.strip()
+            return m
+    return pd.DataFrame(columns=["UIN","Module"])
+
+def parse_client_input_fields_docx(doc_bytes: BytesIO):
+    """
+    Parse 'Client Input Fields.docx' into a dict: {'1': [fields...], '2': [...], ...}
+    Heuristic parser: looks for 'Module 1', 'Module 2', ..., captures following paragraph lines
+    until next 'Module N'.
+    """
+    doc = Document(doc_bytes)
+    modules = {}
+    current = None
+    for p in doc.paragraphs:
+        text = p.text.strip()
+        if not text:
+            continue
+        # detect a module header like "Module 1" or "Module 1 – ..." (robust)
+        m = re.match(r'^\s*module\s*(\d+)\b', text, flags=re.IGNORECASE)
+        if m:
+            current = m.group(1)
+            if current not in modules:
+                modules[current] = []
+            continue
+        if current:
+            # treat bullet points / numbered lines / plain lines as fields
+            modules[current].append(text)
+    # Cleanup: drop duplicate lines and very short separators
+    for k in list(modules.keys()):
+        cleaned = []
+        seen = set()
+        for line in modules[k]:
+            norm = line.strip()
+            if len(norm) < 2: 
+                continue
+            if norm in seen:
+                continue
+            seen.add(norm)
+            cleaned.append(norm)
+        modules[k] = cleaned
+    return modules
+
+def render_dynamic_inputs(fields_list):
+    """
+    Render input widgets based on field label heuristics.
+    - If contains 'date' -> date_input
+    - If contains 'select' or 'dropdown' -> text_input placeholder (choices unknown)
+    - Else -> text_input
+    Returns dict of {label: value}
+    """
+    out = {}
+    for label in fields_list:
+        low = label.lower()
+        key = f"fld::{label}"
+        if "date" in low:
+            out[label] = st.date_input(label, key=key)
+        elif "select" in low or "dropdown" in low or "choose" in low:
+            out[label] = st.text_input(label + " (type your choice)", key=key)
+        else:
+            out[label] = st.text_input(label, key=key)
+    return out
+
 # ----------------------------
 # Sidebar (only the essentials)
 # ----------------------------
 st.sidebar.header("Upload Files")
 lic_file = st.sidebar.file_uploader("LIC 10 Year Plan (Excel)", type=["xlsx","xls"])
-sheet2_file = st.sidebar.file_uploader("Excel Sheet 2 (Age rules)", type=["xlsx","xls"])
+sheet2_file = st.sidebar.file_uploader("Excel Sheet 2 (Age rules + UIN→Module map)", type=["xlsx","xls"])
+# NEW: Word doc with module-specific client inputs
+client_docx = st.sidebar.file_uploader("Client Input Fields (DOCX)", type=["docx"])
 
 st.sidebar.header("Client Inputs")
 name = st.sidebar.text_input("Policy Holder Name", "")
@@ -163,7 +253,7 @@ run = st.sidebar.button("Run Eligibility")
 # ----------------------------
 if run:
     if not lic_file or not sheet2_file or not name:
-        st.error("Please upload both Excel files and enter the Policy Holder Name.")
+        st.error("Please upload LIC Excel, Sheet 2 Excel, enter the Policy Holder Name.")
     else:
         age_years = calc_age_years(dob, purchase)
         st.subheader("Inputs")
@@ -179,7 +269,7 @@ if run:
             lic_xls = pd.ExcelFile(lic_file)
             lic_df, meta = pick_best_lic_sheet(lic_xls)
             if lic_df is None or meta is None or meta.get("score", 0) < 2:
-                st.error("Could not detect UIN / Start / End in LIC file. Please ensure the table has UIN and From/To dates.")
+                st.error("Could not detect UIN / Start / End in LIC file. Ensure the table has UIN and From/To dates.")
                 st.stop()
 
             step1 = step1_active_by_date(lic_df, meta, purchase)
@@ -198,7 +288,7 @@ if run:
             s2_xls = pd.ExcelFile(sheet2_file)
             age_df = build_age_table_auto(s2_xls)
             if age_df.empty:
-                st.error("Could not read age rules from Excel Sheet 2. Ensure sheets are named like 'Policy 1', 'Policy 2', etc., with columns UIN / Minimum Entry Age / Maximum Entry Age.")
+                st.error("Could not read age rules from Excel Sheet 2. Ensure 'Policy ...' sheets have UIN / Minimum / Maximum Entry Age.")
                 st.stop()
 
             st.subheader("Step 2 — Age-Eligible Plans")
@@ -207,11 +297,60 @@ if run:
                 st.error("No plans eligible for this age based on Excel Sheet 2.")
             st.dataframe(final_df, use_container_width=True)
 
+            # Allow the user to select one plan for Step 3
+            selected_uin = None
+            if not final_df.empty:
+                options = (final_df["UIN"] + " — " + final_df.get("PlanName", pd.Series([""]*len(final_df))).fillna("")).tolist()
+                choice = st.selectbox("Select a plan for Step 3", options) if options else None
+                if choice:
+                    selected_uin = choice.split(" — ")[0].strip()
+
             st.download_button("Download Step-1 CSV", step1.to_csv(index=False).encode("utf-8"),
                                file_name="step1_active_plans.csv", mime="text/csv")
             st.download_button("Download Step-2 CSV (Final)", final_df.to_csv(index=False).encode("utf-8"),
                                file_name="step2_age_eligible_plans.csv", mime="text/csv")
         except Exception as e:
             st.exception(e)
+            st.stop()
+
+        # ---------- STEP 3: Module detection + show module fields ----------
+        if selected_uin:
+            st.subheader("Step 3 — Module & Client Input Fields")
+            try:
+                # 1) Build UIN → Module mapping from Sheet 2
+                uin_module_map = find_uin_module_map(s2_xls)
+                if uin_module_map.empty:
+                    st.error("Could not find UIN→Module mapping in Excel Sheet 2 (look for a sheet with UIN and Module columns).")
+                else:
+                    # Normalize selected
+                    uin_clean = selected_uin.strip().upper()
+                    row = uin_module_map[uin_module_map["UIN"] == uin_clean]
+                    if row.empty:
+                        st.error(f"No Module mapping found for UIN: {selected_uin}")
+                    else:
+                        module_raw = str(row.iloc[0]["Module"]).strip()
+                        # Extract numeric module id (supports 'Module 1', '1', etc.)
+                        mm = re.search(r'(\d+)', module_raw)
+                        module_id = mm.group(1) if mm else module_raw
+                        st.success(f"Detected Module: {module_id} (from Excel Sheet 2)")
+
+                        # 2) Parse the Client Input Fields DOCX
+                        if not client_docx:
+                            st.warning("Upload the 'Client Input Fields.docx' in the sidebar to show Module-specific fields.")
+                        else:
+                            fields_by_module = parse_client_input_fields_docx(client_docx)
+                            fields_list = fields_by_module.get(module_id, [])
+                            if not fields_list:
+                                st.warning(f"No fields found in DOCX for Module {module_id}.")
+                            else:
+                                st.write(f"Fields required for Module {module_id}:")
+                                user_inputs = render_dynamic_inputs(fields_list)
+                                st.info("These values can be used in the next steps of your policy review engine.")
+                                # (Optional) Show collected values as a small table
+                                show_df = pd.DataFrame([user_inputs])
+                                st.dataframe(show_df, use_container_width=True)
+            except Exception as e:
+                st.exception(e)
+
 else:
-    st.info("Upload both Excel files, enter Name + DOB + Purchase Date, then click **Run Eligibility**.")
+    st.info("Upload LIC & Sheet 2 Excel files, plus (optional) Client Input Fields.docx. Enter Name + DOB + Purchase Date, then click **Run Eligibility**.")
